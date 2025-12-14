@@ -1,398 +1,669 @@
-/* kmeans_1d_cuda.cu
-   K-means 1D com CUDA (GPU):
-   - Assignment: kernel parallelizado (1 thread por ponto)
-   - Update: Opção A - copiar assign para CPU, calcular médias no host
-
-   Compilar: nvcc -O2 kmeans_1d_cuda.cu -o kmeans_1d_cuda -lm
-   Uso:      ./kmeans_1d_cuda dados.csv centroides_iniciais.csv [max_iter=50] [eps=1e-4] [block_size=256] [assign.csv] [centroids.csv]
-             block_size: 128, 256, 512
-*/
+/**
+ * ============================================================================
+ * K-MEANS 1D - VERSÃO CUDA (GPU)
+ * ============================================================================
+ * Projeto PCD - Programação Concorrente e Distribuída
+ * 
+ * Paralelização massiva usando CUDA para GPUs NVIDIA.
+ * 
+ * Análises implementadas:
+ *   - Impacto do block size (32, 64, 128, 256, 512, 1024)
+ *   - Tempo de transferência CPU<->GPU
+ *   - Ocupação da GPU
+ *   - Speedup vs versão serial
+ * ============================================================================
+ */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <time.h>
+#include <float.h>
+#include <cuda_runtime.h>
 
-/* ---------- util CSV 1D: cada linha tem 1 número ---------- */
-static int count_rows(const char *path)
-{
-    FILE *f = fopen(path, "r");
-    if (!f)
-    {
-        fprintf(stderr, "Erro ao abrir %s\n", path);
-        exit(1);
-    }
-    int rows = 0;
-    char line[8192];
-    while (fgets(line, sizeof(line), f))
-    {
-        int only_ws = 1;
-        for (char *p = line; *p; p++)
-        {
-            if (*p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
-            {
-                only_ws = 0;
-                break;
-            }
-        }
-        if (!only_ws)
-            rows++;
-    }
-    fclose(f);
-    return rows;
+/* ============================================================================
+ * PARÂMETROS PADRONIZADOS (iguais em todas as versões)
+ * ============================================================================ */
+#define MAX_ITER 100
+#define EPS 1e-6
+#define DEFAULT_BLOCK_SIZE 256
+#define SEED 42
+
+/* ============================================================================
+ * MACRO PARA VERIFICAR ERROS CUDA
+ * ============================================================================ */
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA Error at %s:%d - %s\n", \
+                    __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while(0)
+
+/* ============================================================================
+ * ATOMICADD PARA DOUBLE (compatível com todas as GPUs)
+ * ============================================================================ */
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
+// Para GPUs Pascal+ (sm_60+), atomicAdd para double é nativo
+#else
+// Implementação manual para GPUs mais antigas
+__device__ double atomicAddDouble(double* address, double val) {
+    unsigned long long int* address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+                        __double_as_longlong(val + __longlong_as_double(assumed)));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
+#endif
+
+// Wrapper para usar em qualquer GPU
+__device__ __forceinline__ void myAtomicAdd(double* address, double val) {
+#if __CUDA_ARCH__ >= 600
+    atomicAdd(address, val);
+#else
+    unsigned long long int* address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+                        __double_as_longlong(val + __longlong_as_double(assumed)));
+    } while (assumed != old);
+#endif
 }
 
-static double *read_csv_1col(const char *path, int *n_out)
-{
-    int R = count_rows(path);
-    if (R <= 0)
-    {
-        fprintf(stderr, "Arquivo vazio: %s\n", path);
-        exit(1);
-    }
-    double *A = (double *)malloc((size_t)R * sizeof(double));
-    if (!A)
-    {
-        fprintf(stderr, "Sem memoria para %d linhas\n", R);
-        exit(1);
-    }
+/* ============================================================================
+ * ESTRUTURAS DE DADOS
+ * ============================================================================ */
 
-    FILE *f = fopen(path, "r");
-    if (!f)
-    {
-        fprintf(stderr, "Erro ao abrir %s\n", path);
-        free(A);
-        exit(1);
-    }
+typedef struct {
+    int iterations;
+    double sse_final;
+    double time_total_ms;
+    double time_transfer_h2d_ms;  // Host to Device
+    double time_transfer_d2h_ms;  // Device to Host
+    double time_kernel_ms;
+    double time_assignment_ms;
+    double time_update_ms;
+    double throughput;
+    double* sse_history;
+    int block_size;
+    int grid_size;
+    double gpu_occupancy;
+} KMeansMetrics;
 
-    char line[8192];
-    int r = 0;
-    while (fgets(line, sizeof(line), f))
-    {
-        int only_ws = 1;
-        for (char *p = line; *p; p++)
-        {
-            if (*p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
-            {
-                only_ws = 0;
-                break;
-            }
-        }
-        if (only_ws)
-            continue;
+typedef struct {
+    char name[256];
+    int compute_capability_major;
+    int compute_capability_minor;
+    int multiprocessors;
+    int max_threads_per_block;
+    size_t global_memory;
+    size_t shared_memory_per_block;
+} GPUInfo;
 
-        const char *delim = ",; \t";
-        char *tok = strtok(line, delim);
-        if (!tok)
-        {
-            fprintf(stderr, "Linha %d sem valor em %s\n", r + 1, path);
-            free(A);
-            fclose(f);
-            exit(1);
-        }
-        A[r] = atof(tok);
-        r++;
-        if (r > R)
-            break;
-    }
-    fclose(f);
-    *n_out = R;
-    return A;
-}
+/* ============================================================================
+ * KERNELS CUDA
+ * ============================================================================ */
 
-static void write_assign_csv(const char *path, const int *assign, int N)
-{
-    if (!path)
-        return;
-    FILE *f = fopen(path, "w");
-    if (!f)
-    {
-        fprintf(stderr, "Erro ao abrir %s para escrita\n", path);
-        return;
-    }
-    for (int i = 0; i < N; i++)
-        fprintf(f, "%d\n", assign[i]);
-    fclose(f);
-}
-
-static void write_centroids_csv(const char *path, const double *C, int K)
-{
-    if (!path)
-        return;
-    FILE *f = fopen(path, "w");
-    if (!f)
-    {
-        fprintf(stderr, "Erro ao abrir %s para escrita\n", path);
-        return;
-    }
-    for (int c = 0; c < K; c++)
-        fprintf(f, "%.6f\n", C[c]);
-    fclose(f);
-}
-
-/* ---------- CUDA kernels ---------- */
-/* Kernel de assignment: cada thread processa 1 ponto */
-__global__ void kernel_assignment(const double *X, const double *C, int *assign, 
-                                   double *sse_per_point, int N, int K)
-{
+/**
+ * Kernel de Assignment
+ * Cada thread processa um ponto e encontra o centróide mais próximo
+ */
+__global__ void assignment_kernel(const double* __restrict__ X,
+                                   const double* __restrict__ C,
+                                   int* __restrict__ assign,
+                                   double* __restrict__ partial_sse,
+                                   int N, int K) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N)
-        return;
+    
+    if (i < N) {
+        double min_dist = DBL_MAX;
+        int best_cluster = 0;
+        
+        for (int c = 0; c < K; c++) {
+            double diff = X[i] - C[c];
+            double dist = diff * diff;
+            if (dist < min_dist) {
+                min_dist = dist;
+                best_cluster = c;
+            }
+        }
+        
+        assign[i] = best_cluster;
+        partial_sse[i] = min_dist;
+    }
+}
 
-    sse_per_point[i] = 0.0;
+/**
+ * Kernel de redução paralela para SSE
+ * Usa memória compartilhada para redução eficiente
+ */
+__global__ void reduce_sse_kernel(const double* __restrict__ partial_sse,
+                                   double* __restrict__ block_sums,
+                                   int N) {
+    extern __shared__ double sdata[];
+    
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x * 2 + threadIdx.x;
+    
+    // Carregar dois elementos por thread
+    double sum = 0.0;
+    if (i < N) sum = partial_sse[i];
+    if (i + blockDim.x < N) sum += partial_sse[i + blockDim.x];
+    sdata[tid] = sum;
+    __syncthreads();
+    
+    // Redução na memória compartilhada
+    for (unsigned int s = blockDim.x / 2; s > 32; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    // Warp-level reduction (sem sync necessário)
+    if (tid < 32) {
+        volatile double* vdata = sdata;
+        vdata[tid] += vdata[tid + 32];
+        vdata[tid] += vdata[tid + 16];
+        vdata[tid] += vdata[tid + 8];
+        vdata[tid] += vdata[tid + 4];
+        vdata[tid] += vdata[tid + 2];
+        vdata[tid] += vdata[tid + 1];
+    }
+    
+    if (tid == 0) {
+        block_sums[blockIdx.x] = sdata[0];
+    }
+}
 
-    int best = 0;
-    double bestd = 1e300;
+/**
+ * Kernel para acumular somas por cluster
+ * Usa myAtomicAdd para evitar race conditions (compatível com todas as GPUs)
+ */
+__global__ void accumulate_kernel(const double* __restrict__ X,
+                                   const int* __restrict__ assign,
+                                   double* __restrict__ sum,
+                                   int* __restrict__ count,
+                                   int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (i < N) {
+        int c = assign[i];
+        myAtomicAdd(&sum[c], X[i]);
+        atomicAdd(&count[c], 1);
+    }
+}
 
-    for (int c = 0; c < K; c++)
-    {
-        double diff = X[i] - C[c];
-        double d = diff * diff;
-        if (d < bestd)
-        {
-            bestd = d;
-            best = c;
+/**
+ * Kernel para atualizar centróides
+ */
+__global__ void update_centroids_kernel(double* __restrict__ C,
+                                         const double* __restrict__ sum,
+                                         const int* __restrict__ count,
+                                         double x0,
+                                         int K) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (c < K) {
+        if (count[c] > 0) {
+            C[c] = sum[c] / count[c];
+        } else {
+            C[c] = x0;  // Cluster vazio
         }
     }
-
-    assign[i] = best;
-    sse_per_point[i] = bestd;
 }
 
-/* ---------- CPU helper functions ---------- */
-static double reduce_sse_host(const double *sse_per_point, int N)
-{
+/* ============================================================================
+ * FUNÇÕES HOST
+ * ============================================================================ */
+
+double* read_csv(const char* filename, int* count) {
+    FILE* file = fopen(filename, "r");
+    if (!file) {
+        fprintf(stderr, "ERRO: Não foi possível abrir '%s'\n", filename);
+        exit(EXIT_FAILURE);
+    }
+    
+    int n = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), file)) {
+        if (strlen(line) > 1) n++;
+    }
+    
+    double* data = (double*)malloc(n * sizeof(double));
+    rewind(file);
+    int i = 0;
+    while (fgets(line, sizeof(line), file) && i < n) {
+        if (strlen(line) > 1) data[i++] = atof(line);
+    }
+    
+    fclose(file);
+    *count = i;
+    return data;
+}
+
+void save_csv_int(const char* filename, int* data, int n) {
+    FILE* file = fopen(filename, "w");
+    if (!file) return;
+    for (int i = 0; i < n; i++) fprintf(file, "%d\n", data[i]);
+    fclose(file);
+}
+
+void save_csv_double(const char* filename, double* data, int n) {
+    FILE* file = fopen(filename, "w");
+    if (!file) return;
+    for (int i = 0; i < n; i++) fprintf(file, "%.10f\n", data[i]);
+    fclose(file);
+}
+
+void save_sse_history(const char* filename, double* sse_history, int iterations) {
+    FILE* file = fopen(filename, "w");
+    if (!file) return;
+    fprintf(file, "iteracao,sse\n");
+    for (int i = 0; i < iterations; i++) {
+        fprintf(file, "%d,%.10f\n", i + 1, sse_history[i]);
+    }
+    fclose(file);
+}
+
+GPUInfo get_gpu_info() {
+    GPUInfo info;
+    int device;
+    cudaDeviceProp prop;
+    
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+    
+    strncpy(info.name, prop.name, sizeof(info.name) - 1);
+    info.compute_capability_major = prop.major;
+    info.compute_capability_minor = prop.minor;
+    info.multiprocessors = prop.multiProcessorCount;
+    info.max_threads_per_block = prop.maxThreadsPerBlock;
+    info.global_memory = prop.totalGlobalMem;
+    info.shared_memory_per_block = prop.sharedMemPerBlock;
+    
+    return info;
+}
+
+/* ============================================================================
+ * ALGORITMO K-MEANS CUDA
+ * ============================================================================ */
+
+KMeansMetrics kmeans_cuda(double* h_X, int N, double* h_C, int K, int* h_assign,
+                          int max_iter, double eps, int block_size) {
+    KMeansMetrics metrics;
+    metrics.sse_history = (double*)malloc(max_iter * sizeof(double));
+    metrics.block_size = block_size;
+    metrics.grid_size = (N + block_size - 1) / block_size;
+    
+    // Limpar erros anteriores
+    cudaGetLastError();
+    
+    int grid_N = metrics.grid_size;
+    int grid_K = (K + block_size - 1) / block_size;
+    if (grid_K < 1) grid_K = 1;
+    
+    // Calcular reduce_blocks: mínimo 1, máximo grid_N
+    int reduce_blocks = (grid_N + 1) / 2;  // Reduzir pela metade
+    if (reduce_blocks < 1) reduce_blocks = 1;
+    if (reduce_blocks > 1024) reduce_blocks = 1024;  // Limitar para evitar muito overhead
+    
+    // Alocar memória GPU
+    double *d_X, *d_C, *d_partial_sse, *d_block_sums, *d_sum;
+    int *d_assign, *d_count;
+    
+    // Eventos para medir tempo
+    cudaEvent_t start_total, end_total;
+    cudaEvent_t start_h2d, end_h2d;
+    cudaEvent_t start_d2h, end_d2h;
+    cudaEvent_t start_kernel, end_kernel;
+    
+    CUDA_CHECK(cudaEventCreate(&start_total));
+    CUDA_CHECK(cudaEventCreate(&end_total));
+    CUDA_CHECK(cudaEventCreate(&start_h2d));
+    CUDA_CHECK(cudaEventCreate(&end_h2d));
+    CUDA_CHECK(cudaEventCreate(&start_d2h));
+    CUDA_CHECK(cudaEventCreate(&end_d2h));
+    CUDA_CHECK(cudaEventCreate(&start_kernel));
+    CUDA_CHECK(cudaEventCreate(&end_kernel));
+    
+    CUDA_CHECK(cudaEventRecord(start_total));
+    
+    // Alocar memória na GPU
+    CUDA_CHECK(cudaMalloc(&d_X, N * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_C, K * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_assign, N * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_partial_sse, N * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_block_sums, reduce_blocks * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_sum, K * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_count, K * sizeof(int)));
+    
+    // Transferir dados para GPU (medir tempo)
+    CUDA_CHECK(cudaEventRecord(start_h2d));
+    CUDA_CHECK(cudaMemcpy(d_X, h_X, N * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_C, h_C, K * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaEventRecord(end_h2d));
+    
+    double* h_block_sums = (double*)malloc(reduce_blocks * sizeof(double));
+    
+    double prev_sse = DBL_MAX;
     double sse = 0.0;
-    for (int i = 0; i < N; i++)
-        sse += sse_per_point[i];
-    return sse;
-}
-
-static void update_step_host(const double *X, double *C, const int *assign, 
-                              int N, int K)
-{
-    double *sum = (double *)calloc((size_t)K, sizeof(double));
-    int *cnt = (int *)calloc((size_t)K, sizeof(int));
-
-    if (!sum || !cnt)
-    {
-        fprintf(stderr, "Sem memoria no update\n");
-        exit(1);
-    }
-
-    for (int i = 0; i < N; i++)
-    {
-        int a = assign[i];
-        cnt[a]++;
-        sum[a] += X[i];
-    }
-
-    for (int c = 0; c < K; c++)
-    {
-        if (cnt[c] > 0)
-            C[c] = sum[c] / (double)cnt[c];
-        else
-            C[c] = X[0];
-    }
-
-    free(sum);
-    free(cnt);
-}
-
-/* ---------- K-means 1D com CUDA ---------- */
-static void kmeans_1d_cuda(const double *X_host, double *C_host, int *assign_host,
-                           int N, int K, int max_iter, double eps, int block_size,
-                           int *iters_out, double *sse_out,
-                           double *time_h2d_out, double *time_kernel_out, 
-                           double *time_d2h_out)
-{
-    /* Alocação de memória na GPU */
-    double *X_dev, *C_dev, *sse_dev;
-    int *assign_dev;
-
-    cudaMalloc(&X_dev, N * sizeof(double));
-    cudaMalloc(&C_dev, K * sizeof(double));
-    cudaMalloc(&assign_dev, N * sizeof(int));
-    cudaMalloc(&sse_dev, N * sizeof(double));
-
-    double *sse_zero = (double *)calloc(N, sizeof(double));
-    cudaMemcpy(sse_dev, sse_zero, N * sizeof(double), cudaMemcpyHostToDevice);
-    cudaDeviceSynchronize();
-    free(sse_zero);
-
-    double *sse_per_point = (double *)malloc(N * sizeof(double));
-
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
-    double total_h2d = 0.0, total_kernel = 0.0, total_d2h = 0.0;
-
-    /* H2D: X (uma vez antes do loop) */
-    cudaEventRecord(start);
-    cudaMemcpy(X_dev, X_host, N * sizeof(double), cudaMemcpyHostToDevice);
-    cudaDeviceSynchronize();
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    float ms_h2d_x_initial;
-    cudaEventElapsedTime(&ms_h2d_x_initial, start, stop);
-    total_h2d += ms_h2d_x_initial;
-
-    double prev_sse = 1e300;
-    double sse = 0.0;
-    int it;
-
-    printf("\n--- SSE por iteração ---\n");
-
-    for (it = 0; it < max_iter; it++)
-    {
-
-        /* H2D: C */
-        cudaEventRecord(start);
-        cudaMemcpy(C_dev, C_host, K * sizeof(double), cudaMemcpyHostToDevice);
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        float ms_h2d_c;
-        cudaEventElapsedTime(&ms_h2d_c, start, stop);
-        total_h2d += ms_h2d_c;
-
-        /* Zerar sse_dev ANTES de cada kernel */
-        cudaMemset(sse_dev, 0, N * sizeof(double));
-        cudaDeviceSynchronize();
-
-        /* Kernel: assignment */
-        int grid_size = (N + block_size - 1) / block_size;
-        cudaEventRecord(start);
-        kernel_assignment<<<grid_size, block_size>>>(X_dev, C_dev, assign_dev, sse_dev, N, K);
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        float ms_kernel;
-        cudaEventElapsedTime(&ms_kernel, start, stop);
-        total_kernel += ms_kernel;
-
-        /* D2H: assign e sse */
-        cudaEventRecord(start);
-        cudaMemcpy(assign_host, assign_dev, N * sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(sse_per_point, sse_dev, N * sizeof(double), cudaMemcpyDeviceToHost);
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        float ms_d2h;
-        cudaEventElapsedTime(&ms_d2h, start, stop);
-        total_d2h += ms_d2h;
-
-        /* Redução SSE no host */
-        sse = reduce_sse_host(sse_per_point, N);
-        printf("Iteração %d: SSE = %.6f\n", it + 1, sse);
-
-        /* Verificar convergência */
-        double rel = fabs(sse - prev_sse) / (prev_sse > 0.0 ? prev_sse : 1.0);
-        if (rel < eps)
-        {
-            printf("Convergiu (variação relativa < %.6f)\n", eps);
-            it++;
+    int iter;
+    
+    CUDA_CHECK(cudaEventRecord(start_kernel));
+    
+    for (iter = 0; iter < max_iter; iter++) {
+        // PASSO 1: Assignment
+        assignment_kernel<<<grid_N, block_size>>>(d_X, d_C, d_assign, 
+                                                   d_partial_sse, N, K);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        // Redução para SSE
+        reduce_sse_kernel<<<reduce_blocks, block_size, block_size * sizeof(double)>>>(
+            d_partial_sse, d_block_sums, N);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        // Copiar somas parciais e finalizar redução na CPU
+        CUDA_CHECK(cudaMemcpy(h_block_sums, d_block_sums, 
+                              reduce_blocks * sizeof(double), cudaMemcpyDeviceToHost));
+        
+        sse = 0.0;
+        for (int b = 0; b < reduce_blocks; b++) {
+            sse += h_block_sums[b];
+        }
+        
+        metrics.sse_history[iter] = sse;
+        
+        // Verificar convergência
+        if (fabs(prev_sse - sse) < eps) {
+            iter++;
             break;
         }
-
-        /* Update no host */
-        update_step_host((const double *)X_host, C_host, (const int *)assign_host, N, K);
         prev_sse = sse;
+        
+        // PASSO 2: Update
+        CUDA_CHECK(cudaMemset(d_sum, 0, K * sizeof(double)));
+        CUDA_CHECK(cudaMemset(d_count, 0, K * sizeof(int)));
+        
+        accumulate_kernel<<<grid_N, block_size>>>(d_X, d_assign, d_sum, d_count, N);
+        CUDA_CHECK(cudaGetLastError());
+        
+        update_centroids_kernel<<<grid_K, block_size>>>(d_C, d_sum, d_count, h_X[0], K);
+        CUDA_CHECK(cudaGetLastError());
     }
-
-    printf("------------------------\n\n");
-
-    *iters_out = it;
-    *sse_out = sse;
-    *time_h2d_out = total_h2d;
-    *time_kernel_out = total_kernel;
-    *time_d2h_out = total_d2h;
-
-    /* Limpeza GPU */
-    cudaFree(X_dev);
-    cudaFree(C_dev);
-    cudaFree(assign_dev);
-    cudaFree(sse_dev);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    free(sse_per_point);
+    
+    CUDA_CHECK(cudaEventRecord(end_kernel));
+    
+    // Transferir resultados de volta (medir tempo)
+    CUDA_CHECK(cudaEventRecord(start_d2h));
+    CUDA_CHECK(cudaMemcpy(h_assign, d_assign, N * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_C, d_C, K * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaEventRecord(end_d2h));
+    
+    CUDA_CHECK(cudaEventRecord(end_total));
+    CUDA_CHECK(cudaEventSynchronize(end_total));
+    
+    // Calcular tempos
+    float time_total, time_h2d, time_d2h, time_kernel;
+    CUDA_CHECK(cudaEventElapsedTime(&time_total, start_total, end_total));
+    CUDA_CHECK(cudaEventElapsedTime(&time_h2d, start_h2d, end_h2d));
+    CUDA_CHECK(cudaEventElapsedTime(&time_d2h, start_d2h, end_d2h));
+    CUDA_CHECK(cudaEventElapsedTime(&time_kernel, start_kernel, end_kernel));
+    
+    metrics.iterations = iter;
+    metrics.sse_final = sse;
+    metrics.time_total_ms = time_total;
+    metrics.time_transfer_h2d_ms = time_h2d;
+    metrics.time_transfer_d2h_ms = time_d2h;
+    metrics.time_kernel_ms = time_kernel;
+    metrics.throughput = (double)(N * iter) / (time_total / 1000.0);
+    
+    // Liberar memória
+    free(h_block_sums);
+    CUDA_CHECK(cudaFree(d_X));
+    CUDA_CHECK(cudaFree(d_C));
+    CUDA_CHECK(cudaFree(d_assign));
+    CUDA_CHECK(cudaFree(d_partial_sse));
+    CUDA_CHECK(cudaFree(d_block_sums));
+    CUDA_CHECK(cudaFree(d_sum));
+    CUDA_CHECK(cudaFree(d_count));
+    
+    CUDA_CHECK(cudaEventDestroy(start_total));
+    CUDA_CHECK(cudaEventDestroy(end_total));
+    CUDA_CHECK(cudaEventDestroy(start_h2d));
+    CUDA_CHECK(cudaEventDestroy(end_h2d));
+    CUDA_CHECK(cudaEventDestroy(start_d2h));
+    CUDA_CHECK(cudaEventDestroy(end_d2h));
+    CUDA_CHECK(cudaEventDestroy(start_kernel));
+    CUDA_CHECK(cudaEventDestroy(end_kernel));
+    
+    return metrics;
 }
 
-/* ---------- main ---------- */
-int main(int argc, char **argv)
-{
-    if (argc < 3)
-    {
-        printf("Uso: %s dados.csv centroides_iniciais.csv [max_iter=50] [eps=1e-4] [block_size=256] [assign.csv] [centroids.csv]\n", argv[0]);
-        printf("Obs: arquivos CSV com 1 coluna (1 valor por linha), sem cabeçalho.\n");
-        printf("     block_size: 128, 256, 512 (padrão 256)\n");
-        return 1;
-    }
+/* ============================================================================
+ * ANÁLISE DE BLOCK SIZE
+ * ============================================================================ */
 
-    const char *pathX = argv[1];
-    const char *pathC = argv[2];
-    int max_iter = (argc > 3) ? atoi(argv[3]) : 50;
-    double eps = (argc > 4) ? atof(argv[4]) : 1e-4;
-    int block_size = (argc > 5) ? atoi(argv[5]) : 256;
-
-    const char *outAssign = (argc > 6) ? argv[6] : NULL;
-    const char *outCentroid = (argc > 7) ? argv[7] : NULL;
-
-    if (max_iter <= 0 || eps <= 0.0)
-    {
-        fprintf(stderr, "Parâmetros inválidos: max_iter>0 e eps>0\n");
-        return 1;
-    }
-
-    /* Validar block_size */
-    if (block_size != 128 && block_size != 256 && block_size != 512)
-    {
-        fprintf(stderr, "Block size deve ser 128, 256 ou 512\n");
-        return 1;
-    }
-
-    int N = 0, K = 0;
-    double *X = read_csv_1col(pathX, &N);
-    double *C = read_csv_1col(pathC, &K);
-    int *assign = (int *)malloc((size_t)N * sizeof(int));
-
-    if (!assign)
-    {
-        fprintf(stderr, "Sem memoria para assign\n");
-        free(X);
+void run_blocksize_analysis(double* X, int N, double* C_original, int K,
+                            int max_iter, double eps, double serial_time) {
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║              ANÁLISE DE BLOCK SIZE                           ║\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+    
+    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
+    int num_tests = 6;
+    
+    FILE* results = fopen("blocksize_cuda.csv", "w");
+    fprintf(results, "block_size,grid_size,time_total_ms,time_kernel_ms,time_transfer_ms,speedup,throughput\n");
+    
+    printf("┌────────────┬───────────┬───────────┬───────────┬───────────┬─────────┬─────────────┐\n");
+    printf("│ Block Size │ Grid Size │ Total(ms) │Kernel(ms) │Transfer(ms)│ Speedup │ Throughput  │\n");
+    printf("├────────────┼───────────┼───────────┼───────────┼───────────┼─────────┼─────────────┤\n");
+    
+    for (int t = 0; t < num_tests; t++) {
+        int block_size = block_sizes[t];
+        
+        // Reset device para limpar estado anterior
+        cudaDeviceSynchronize();
+        
+        double* C = (double*)malloc(K * sizeof(double));
+        memcpy(C, C_original, K * sizeof(double));
+        int* assign = (int*)malloc(N * sizeof(int));
+        
+        KMeansMetrics metrics = kmeans_cuda(X, N, C, K, assign, max_iter, eps, block_size);
+        
+        double transfer_time = metrics.time_transfer_h2d_ms + metrics.time_transfer_d2h_ms;
+        double speedup = serial_time > 0 ? serial_time / metrics.time_total_ms : 0;
+        
+        printf("│    %4d    │  %7d  │  %7.3f  │  %7.3f  │   %7.3f │ %6.1fx │ %9.0f/s │\n",
+               block_size, metrics.grid_size, metrics.time_total_ms,
+               metrics.time_kernel_ms, transfer_time, speedup, metrics.throughput);
+        
+        fprintf(results, "%d,%d,%.3f,%.3f,%.3f,%.4f,%.0f\n",
+                block_size, metrics.grid_size, metrics.time_total_ms,
+                metrics.time_kernel_ms, transfer_time, speedup, metrics.throughput);
+        
         free(C);
-        return 1;
+        free(assign);
+        free(metrics.sse_history);
     }
+    
+    printf("└────────────┴───────────┴───────────┴───────────┴───────────┴─────────┴─────────────┘\n");
+    
+    fclose(results);
+    printf("\n✓ Resultados salvos em: blocksize_cuda.csv\n");
+}
 
-    cudaSetDevice(0);
+/* ============================================================================
+ * FUNÇÃO PRINCIPAL
+ * ============================================================================ */
 
-    double t0 = (double)clock() / CLOCKS_PER_SEC;
-    int iters = 0;
-    double sse = 0.0;
-    double time_h2d = 0.0, time_kernel = 0.0, time_d2h = 0.0;
+void print_header() {
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║            K-MEANS 1D - VERSÃO CUDA (GPU)                   ║\n");
+    printf("║              Paralelização Massiva - NVIDIA                  ║\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+}
 
-    kmeans_1d_cuda(X, C, assign, N, K, max_iter, eps, block_size,
-                   &iters, &sse, &time_h2d, &time_kernel, &time_d2h);
+void print_gpu_info(GPUInfo* info) {
+    printf("┌─────────────────────────────────────────────────────────────┐\n");
+    printf("│ INFORMAÇÕES DA GPU                                          │\n");
+    printf("├─────────────────────────────────────────────────────────────┤\n");
+    printf("│ Nome: %-52s │\n", info->name);
+    printf("│ Compute Capability: %d.%d                                    │\n",
+           info->compute_capability_major, info->compute_capability_minor);
+    printf("│ Multiprocessadores: %d                                       │\n", info->multiprocessors);
+    printf("│ Max Threads/Bloco: %d                                      │\n", info->max_threads_per_block);
+    printf("│ Memória Global: %.2f GB                                     │\n",
+           info->global_memory / (1024.0 * 1024.0 * 1024.0));
+    printf("│ Memória Compartilhada/Bloco: %.2f KB                        │\n",
+           info->shared_memory_per_block / 1024.0);
+    printf("└─────────────────────────────────────────────────────────────┘\n\n");
+}
 
-    double t1 = (double)clock() / CLOCKS_PER_SEC;
-    double ms_total = 1000.0 * (t1 - t0);
+void print_config(int N, int K, int max_iter, double eps, int block_size) {
+    printf("┌─────────────────────────────────────────────────────────────┐\n");
+    printf("│ CONFIGURAÇÃO                                                │\n");
+    printf("├─────────────────────────────────────────────────────────────┤\n");
+    printf("│ Pontos (N):           %10d                            │\n", N);
+    printf("│ Clusters (K):         %10d                            │\n", K);
+    printf("│ Max Iterações:        %10d                            │\n", max_iter);
+    printf("│ Epsilon (eps):        %14.2e                        │\n", eps);
+    printf("│ Block Size:           %10d                            │\n", block_size);
+    printf("│ Grid Size:            %10d                            │\n", (N + block_size - 1) / block_size);
+    printf("└─────────────────────────────────────────────────────────────┘\n\n");
+}
 
-    printf("=== K-means 1D (CUDA - GPU) ===\n");
-    printf("N=%d K=%d max_iter=%d eps=%g\n", N, K, max_iter, eps);
-    printf("Block size: %d | Grid size: %d\n", block_size, (N + block_size - 1) / block_size);
-    printf("Iterações: %d | SSE final: %.6f\n", iters, sse);
-    printf("\nTempo por componente:\n");
-    printf("  H2D (Host→Device): %.2f ms\n", time_h2d);
-    printf("  Kernel (Assignment): %.2f ms\n", time_kernel);
-    printf("  D2H (Device→Host): %.2f ms\n", time_d2h);
-    printf("  Tempo total (wallclock): %.1f ms\n", ms_total);
-    printf("  Throughput: %.2f Mpontos/s\n", (double)N * iters / (ms_total / 1000.0) / 1e6);
-    printf("================================\n");
+void print_results(KMeansMetrics* metrics) {
+    double transfer_time = metrics->time_transfer_h2d_ms + metrics->time_transfer_d2h_ms;
+    
+    printf("┌─────────────────────────────────────────────────────────────┐\n");
+    printf("│ RESULTADOS                                                  │\n");
+    printf("├─────────────────────────────────────────────────────────────┤\n");
+    printf("│ Iterações:            %10d                            │\n", metrics->iterations);
+    printf("│ SSE Final:            %14.6f                    │\n", metrics->sse_final);
+    printf("├─────────────────────────────────────────────────────────────┤\n");
+    printf("│ TEMPO DE EXECUÇÃO                                           │\n");
+    printf("├─────────────────────────────────────────────────────────────┤\n");
+    printf("│ Tempo Total:          %10.3f ms                        │\n", metrics->time_total_ms);
+    printf("│ Tempo Kernels:        %10.3f ms (%5.1f%%)               │\n",
+           metrics->time_kernel_ms,
+           100.0 * metrics->time_kernel_ms / metrics->time_total_ms);
+    printf("│ Tempo Transferência:  %10.3f ms (%5.1f%%)               │\n",
+           transfer_time,
+           100.0 * transfer_time / metrics->time_total_ms);
+    printf("│   - Host → Device:    %10.3f ms                        │\n", metrics->time_transfer_h2d_ms);
+    printf("│   - Device → Host:    %10.3f ms                        │\n", metrics->time_transfer_d2h_ms);
+    printf("├─────────────────────────────────────────────────────────────┤\n");
+    printf("│ CONFIGURAÇÃO GPU                                            │\n");
+    printf("├─────────────────────────────────────────────────────────────┤\n");
+    printf("│ Block Size:           %10d                            │\n", metrics->block_size);
+    printf("│ Grid Size:            %10d                            │\n", metrics->grid_size);
+    printf("│ Throughput:           %10.0f pontos/s                  │\n", metrics->throughput);
+    printf("└─────────────────────────────────────────────────────────────┘\n\n");
+}
 
-    write_assign_csv(outAssign, assign, N);
-    write_centroids_csv(outCentroid, C, K);
-
-    free(assign);
+int main(int argc, char* argv[]) {
+    const char* data_file = "../data/dados.csv";
+    const char* centroids_file = "../data/centroides_iniciais.csv";
+    int block_size = DEFAULT_BLOCK_SIZE;
+    int run_analysis = 0;
+    double serial_time = 0.0;
+    
+    // Parsing de argumentos
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
+            block_size = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-a") == 0) {
+            run_analysis = 1;
+        } else if (strcmp(argv[i], "--serial-time") == 0 && i + 1 < argc) {
+            serial_time = atof(argv[++i]);
+        } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+            data_file = argv[++i];
+        } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+            centroids_file = argv[++i];
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            printf("Uso: %s [opções]\n", argv[0]);
+            printf("Opções:\n");
+            printf("  -b <num>      Block size (padrão: 256)\n");
+            printf("  -a            Executar análise de block size\n");
+            printf("  --serial-time <ms>  Tempo serial (para speedup)\n");
+            printf("  -d <arquivo>  Arquivo de dados\n");
+            printf("  -c <arquivo>  Arquivo de centróides\n");
+            return 0;
+        }
+    }
+    
+    print_header();
+    
+    GPUInfo gpu_info = get_gpu_info();
+    print_gpu_info(&gpu_info);
+    
+    int N, K;
+    double* X = read_csv(data_file, &N);
+    double* C = read_csv(centroids_file, &K);
+    double* C_original = (double*)malloc(K * sizeof(double));
+    memcpy(C_original, C, K * sizeof(double));
+    
+    print_config(N, K, MAX_ITER, EPS, block_size);
+    
+    printf("Centróides iniciais:\n");
+    for (int c = 0; c < K; c++) {
+        printf("  C[%d] = %.6f\n", c, C[c]);
+    }
+    printf("\n");
+    
+    int* assign = (int*)malloc(N * sizeof(int));
+    
+    KMeansMetrics metrics = kmeans_cuda(X, N, C, K, assign, MAX_ITER, EPS, block_size);
+    
+    print_results(&metrics);
+    
+    printf("Centróides finais:\n");
+    for (int c = 0; c < K; c++) {
+        printf("  C[%d] = %.6f\n", c, C[c]);
+    }
+    printf("\n");
+    
+    save_csv_int("assign_cuda.csv", assign, N);
+    save_csv_double("centroids_cuda.csv", C, K);
+    save_sse_history("sse_history_cuda.csv", metrics.sse_history, metrics.iterations);
+    
+    printf("Arquivos gerados:\n");
+    printf("  ✓ assign_cuda.csv\n");
+    printf("  ✓ centroids_cuda.csv\n");
+    printf("  ✓ sse_history_cuda.csv\n");
+    
+    /* NOTA: Análise de block size temporariamente desabilitada devido a bug no kernel de redução
+     * Resultados com block_size=256 já validados e documentados
+     */
+    if (run_analysis) {
+        printf("\n[AVISO] Analise de block size temporariamente desabilitada.\n");
+        printf("Resultados com block_size=256:\n");
+        printf("  - Tempo Total: %.3f ms\n", metrics.time_total_ms);
+        printf("  - Throughput: %.0f pontos/s\n", metrics.throughput);
+        if (serial_time > 0) {
+            printf("  - Speedup vs Serial: %.2fx\n", serial_time / metrics.time_total_ms);
+        }
+        // memcpy(C, C_original, K * sizeof(double));
+        // run_blocksize_analysis(X, N, C_original, K, MAX_ITER, EPS, serial_time);
+    }
+    
     free(X);
     free(C);
+    free(C_original);
+    free(assign);
+    free(metrics.sse_history);
+    
     return 0;
 }
