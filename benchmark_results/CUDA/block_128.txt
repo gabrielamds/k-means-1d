@@ -1,0 +1,36 @@
+=========================================
+CUDA Benchmark - Block Size: 128
+=========================================
+Block Size: 128
+
+Timings:
+  H2D Time: 3.55 ms
+  Kernel Time: 7.42 ms
+  D2H Time: 10.61 ms
+  Total Time: 28.8 ms
+
+Performance:
+  Throughput: 69.38 Mpontos/s
+  Speedup vs Serial: N/Ax
+
+Full Output:
+
+--- SSE por iteração ---
+Iteração 1: SSE = 0.000000
+Iteração 2: SSE = 0.000000
+Convergiu (variação relativa < 0.000100)
+------------------------
+
+=== K-means 1D (CUDA - GPU) ===
+N=1000000 K=16 max_iter=50 eps=0.0001
+Block size: 128 | Grid size: 7813
+Iterações: 2 | SSE final: 0.000000
+
+Tempo por componente:
+  H2D (Host→Device): 3.55 ms
+  Kernel (Assignment): 7.42 ms
+  D2H (Device→Host): 10.61 ms
+  Tempo total (wallclock): 28.8 ms
+  Throughput: 69.38 Mpontos/s
+================================
+=========================================

@@ -1,0 +1,23 @@
+--- SSE por iteração ---
+Iteração 1: SSE = 8885739374.429031
+Iteração 2: SSE = 1712335154.246161
+Iteração 3: SSE = 1215557411.377951
+Iteração 4: SSE = 1025325313.748961
+Iteração 5: SSE = 1024078274.200855
+Iteração 6: SSE = 1023405344.261051
+Iteração 7: SSE = 1022883071.895066
+Iteração 8: SSE = 1022198302.641739
+Iteração 9: SSE = 1020227542.539612
+Iteração 10: SSE = 1005868788.610623
+Iteração 11: SSE = 859969440.976234
+Iteração 12: SSE = 717110857.793873
+Iteração 13: SSE = 716039787.931159
+Iteração 14: SSE = 716035244.206454
+Convergiu (variação relativa < 0.000100)
+------------------------
+
+=== K-means 1D (OpenMP paralelo) ===
+N=1000000 K=16 max_iter=50 eps=0.0001
+Threads: 16 | Schedule: static (chunk=10)
+Iterações: 14 | SSE final: 716035244.206454 | Tempo: 174.4 ms
+====================================
