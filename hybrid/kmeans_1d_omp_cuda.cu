@@ -139,6 +139,8 @@ __global__ void kernel_assignment(const double *X, const double *C, int *assign,
     if (i >= N)
         return;
 
+    sse_per_point[i] = 0.0;
+
     int best = 0;
     double bestd = 1e300;
 
@@ -165,6 +167,57 @@ static void kmeans_1d_hybrid_omp_cuda(const double *X_host, double *C_host, int 
 {
     omp_set_num_threads(num_threads);
     
+    typedef struct {
+        cudaStream_t stream;
+        double *X_dev;
+        double *C_dev;
+        double *sse_dev;
+        int *assign_dev;
+        double *sse_local;
+        int start;
+        int local_N;
+    } thread_context_t;
+
+    thread_context_t *contexts = (thread_context_t *)malloc(num_threads * sizeof(thread_context_t));
+
+    /* Initialize thread contexts */
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        int nthreads = omp_get_num_threads();
+
+        /* Divisão de trabalho entre threads OpenMP */
+        int chunk_size = (N + nthreads - 1) / nthreads;
+        int start = tid * chunk_size;
+        int end = start + chunk_size;
+        if (end > N) end = N;
+        int local_N = end - start;
+
+        contexts[tid].start = start;
+        contexts[tid].local_N = local_N;
+
+        if (local_N > 0)
+        {
+            cudaStreamCreate(&contexts[tid].stream);
+            cudaMalloc(&contexts[tid].X_dev, local_N * sizeof(double));
+            cudaMalloc(&contexts[tid].C_dev, K * sizeof(double));
+            cudaMalloc(&contexts[tid].assign_dev, local_N * sizeof(int));
+            cudaMalloc(&contexts[tid].sse_dev, local_N * sizeof(double));
+            
+            double *sse_zero = (double *)calloc(local_N, sizeof(double));
+            cudaMemcpyAsync(contexts[tid].sse_dev, sse_zero, local_N * sizeof(double), 
+                           cudaMemcpyHostToDevice, contexts[tid].stream);
+            cudaStreamSynchronize(contexts[tid].stream);
+            free(sse_zero);
+            
+            contexts[tid].sse_local = (double *)malloc(local_N * sizeof(double));
+
+            cudaMemcpyAsync(contexts[tid].X_dev, &X_host[start], local_N * sizeof(double), 
+                           cudaMemcpyHostToDevice, contexts[tid].stream);
+            cudaStreamSynchronize(contexts[tid].stream);
+        }
+    }
+    
     double prev_sse = 1e300;
     double sse_global = 0.0;
     int it;
@@ -179,76 +232,54 @@ static void kmeans_1d_hybrid_omp_cuda(const double *X_host, double *C_host, int 
         #pragma omp parallel reduction(+:sse_global)
         {
             int tid = omp_get_thread_num();
-            int nthreads = omp_get_num_threads();
-
-            /* Divisão de trabalho entre threads OpenMP */
-            int chunk_size = (N + nthreads - 1) / nthreads;
-            int start = tid * chunk_size;
-            int end = start + chunk_size;
-            if (end > N) end = N;
-            int local_N = end - start;
+            int local_N = contexts[tid].local_N;
+            int start = contexts[tid].start;
 
             if (local_N > 0)
             {
-                /* Cada thread tem seu próprio stream CUDA */
-                cudaStream_t stream;
-                cudaStreamCreate(&stream);
+                cudaMemcpyAsync(contexts[tid].C_dev, C_host, K * sizeof(double), 
+                               cudaMemcpyHostToDevice, contexts[tid].stream);
+                cudaStreamSynchronize(contexts[tid].stream);
 
-                /* Alocação GPU para este chunk */
-                double *X_dev, *C_dev, *sse_dev;
-                int *assign_dev;
-
-                cudaMalloc(&X_dev, local_N * sizeof(double));
-                cudaMalloc(&C_dev, K * sizeof(double));
-                cudaMalloc(&assign_dev, local_N * sizeof(int));
-                cudaMalloc(&sse_dev, local_N * sizeof(double));
-
-                /* Copia dados para GPU (assíncrono) */
-                cudaMemcpyAsync(X_dev, &X_host[start], local_N * sizeof(double), 
-                               cudaMemcpyHostToDevice, stream);
-                cudaMemcpyAsync(C_dev, C_host, K * sizeof(double), 
-                               cudaMemcpyHostToDevice, stream);
+                cudaMemsetAsync(contexts[tid].sse_dev, 0, local_N * sizeof(double), contexts[tid].stream);
+                cudaStreamSynchronize(contexts[tid].stream);
 
                 /* Kernel assignment */
                 int grid_size = (local_N + block_size - 1) / block_size;
-                kernel_assignment<<<grid_size, block_size, 0, stream>>>(
-                    X_dev, C_dev, assign_dev, sse_dev, local_N, K, start);
+                kernel_assignment<<<grid_size, block_size, 0, contexts[tid].stream>>>(
+                    contexts[tid].X_dev, contexts[tid].C_dev, contexts[tid].assign_dev, 
+                    contexts[tid].sse_dev, local_N, K, start);
+
+                cudaStreamSynchronize(contexts[tid].stream);
 
                 /* Copia resultados de volta (assíncrono) */
-                double *sse_local = (double *)malloc(local_N * sizeof(double));
-                cudaMemcpyAsync(&assign_host[start], assign_dev, local_N * sizeof(int), 
-                               cudaMemcpyDeviceToHost, stream);
-                cudaMemcpyAsync(sse_local, sse_dev, local_N * sizeof(double), 
-                               cudaMemcpyDeviceToHost, stream);
+                cudaMemcpyAsync(&assign_host[start], contexts[tid].assign_dev, local_N * sizeof(int), 
+                               cudaMemcpyDeviceToHost, contexts[tid].stream);
+                cudaMemcpyAsync(contexts[tid].sse_local, contexts[tid].sse_dev, local_N * sizeof(double), 
+                               cudaMemcpyDeviceToHost, contexts[tid].stream);
 
                 /* Sincroniza stream */
-                cudaStreamSynchronize(stream);
+                cudaStreamSynchronize(contexts[tid].stream);
 
                 /* Redução local do SSE */
                 double sse_thread = 0.0;
                 for (int i = 0; i < local_N; i++)
-                    sse_thread += sse_local[i];
+                    sse_thread += contexts[tid].sse_local[i];
                 sse_global += sse_thread;
-
-                /* Limpeza */
-                free(sse_local);
-                cudaFree(X_dev);
-                cudaFree(C_dev);
-                cudaFree(assign_dev);
-                cudaFree(sse_dev);
-                cudaStreamDestroy(stream);
             }
         }
 
         printf("Iteração %d: SSE = %.6f\n", it + 1, sse_global);
 
         /* Convergência */
-        double rel = fabs(sse_global - prev_sse) / (prev_sse > 0.0 ? prev_sse : 1.0);
-        if (rel < eps)
-        {
-            printf("Convergiu (variação relativa < %.6f)\n", eps);
-            it++;
-            break;
+        if (it > 0) {
+            double rel = fabs(sse_global - prev_sse) / (prev_sse > 0.0 ? prev_sse : 1.0);
+            if (rel < eps)
+            {
+                printf("Convergiu (variação relativa < %.6f)\n", eps);
+                it++;
+                break;
+            }
         }
 
         /* Update no host (sequencial) */
@@ -276,6 +307,22 @@ static void kmeans_1d_hybrid_omp_cuda(const double *X_host, double *C_host, int 
     }
 
     printf("--------------------------------------\n\n");
+
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        if (contexts[tid].local_N > 0)
+        {
+            free(contexts[tid].sse_local);
+            cudaFree(contexts[tid].X_dev);
+            cudaFree(contexts[tid].C_dev);
+            cudaFree(contexts[tid].assign_dev);
+            cudaFree(contexts[tid].sse_dev);
+            cudaStreamDestroy(contexts[tid].stream);
+        }
+    }
+
+    free(contexts);
 
     *iters_out = it;
     *sse_out = sse_global;

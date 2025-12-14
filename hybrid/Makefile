@@ -10,7 +10,7 @@ kmeans_1d_omp_mpi: kmeans_1d_omp_mpi.c
 
 # MPI + CUDA
 kmeans_1d_mpi_cuda: kmeans_1d_mpi_cuda.cu
-	nvcc -O2 -arch=sm_70 kmeans_1d_mpi_cuda.cu -o kmeans_1d_mpi_cuda -lmpi
+	nvcc -O2 -I/usr/include/openmpi-x86_64 -L/usr/lib64/openmpi/lib kmeans_1d_mpi_cuda.cu -o kmeans_1d_mpi_cuda -lmpi
 
 all: kmeans_1d_omp_cuda kmeans_1d_omp_mpi kmeans_1d_mpi_cuda
 

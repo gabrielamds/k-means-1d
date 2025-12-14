@@ -140,6 +140,8 @@ __global__ void kernel_assignment(const double *X, const double *C, int *assign,
     if (i >= N)
         return;
 
+    sse_per_point[i] = 0.0;
+
     int best = 0;
     double bestd = 1e300;
 
@@ -214,6 +216,11 @@ static void kmeans_1d_cuda(const double *X_host, double *C_host, int *assign_hos
     cudaMalloc(&assign_dev, N * sizeof(int));
     cudaMalloc(&sse_dev, N * sizeof(double));
 
+    double *sse_zero = (double *)calloc(N, sizeof(double));
+    cudaMemcpy(sse_dev, sse_zero, N * sizeof(double), cudaMemcpyHostToDevice);
+    cudaDeviceSynchronize();
+    free(sse_zero);
+
     double *sse_per_point = (double *)malloc(N * sizeof(double));
 
     cudaEvent_t start, stop;
@@ -221,6 +228,16 @@ static void kmeans_1d_cuda(const double *X_host, double *C_host, int *assign_hos
     cudaEventCreate(&stop);
 
     double total_h2d = 0.0, total_kernel = 0.0, total_d2h = 0.0;
+
+    /* H2D: X (uma vez antes do loop) */
+    cudaEventRecord(start);
+    cudaMemcpy(X_dev, X_host, N * sizeof(double), cudaMemcpyHostToDevice);
+    cudaDeviceSynchronize();
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms_h2d_x_initial;
+    cudaEventElapsedTime(&ms_h2d_x_initial, start, stop);
+    total_h2d += ms_h2d_x_initial;
 
     double prev_sse = 1e300;
     double sse = 0.0;
@@ -230,14 +247,6 @@ static void kmeans_1d_cuda(const double *X_host, double *C_host, int *assign_hos
 
     for (it = 0; it < max_iter; it++)
     {
-        /* H2D: X */
-        cudaEventRecord(start);
-        cudaMemcpy(X_dev, X_host, N * sizeof(double), cudaMemcpyHostToDevice);
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        float ms_h2d_x;
-        cudaEventElapsedTime(&ms_h2d_x, start, stop);
-        total_h2d += ms_h2d_x;
 
         /* H2D: C */
         cudaEventRecord(start);
@@ -247,6 +256,10 @@ static void kmeans_1d_cuda(const double *X_host, double *C_host, int *assign_hos
         float ms_h2d_c;
         cudaEventElapsedTime(&ms_h2d_c, start, stop);
         total_h2d += ms_h2d_c;
+
+        /* Zerar sse_dev ANTES de cada kernel */
+        cudaMemset(sse_dev, 0, N * sizeof(double));
+        cudaDeviceSynchronize();
 
         /* Kernel: assignment */
         int grid_size = (N + block_size - 1) / block_size;

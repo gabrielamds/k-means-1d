@@ -1,1 +1,40 @@
-.venv
+# Executáveis
+kmeans_1d_*
+*.out
+*.exe
+
+# Arquivos objeto
+*.o
+*.obj
+
+# Arquivos de dados grandes
+data/dados_grande.csv
+data/dados_xlarge.csv
+
+# Resultados e saídas
+results/*.txt
+report/figures/*.png
+*.csv
+
+# Arquivos temporários
+*.tmp
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sistema
+.DS_Store
+Thumbs.db

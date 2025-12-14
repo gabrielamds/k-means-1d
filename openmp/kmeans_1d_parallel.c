@@ -170,7 +170,10 @@ static void update_step_1d(const double *X, double *C, const int *assign, int N,
 {
     int num_threads = omp_get_max_threads();
 
-    /* Aloca acumuladores por thread: sum_thread[thread_id][cluster_id] */
+#define CACHE_LINE_SIZE 64
+#define PADDING (CACHE_LINE_SIZE / sizeof(double))
+
+    /* Aloca acumuladores por thread com padding para evitar false sharing */
     double **sum_thread = (double **)malloc((size_t)num_threads * sizeof(double *));
     int **cnt_thread = (int **)malloc((size_t)num_threads * sizeof(int *));
 
@@ -182,8 +185,8 @@ static void update_step_1d(const double *X, double *C, const int *assign, int N,
 
     for (int t = 0; t < num_threads; t++)
     {
-        sum_thread[t] = (double *)calloc((size_t)K, sizeof(double));
-        cnt_thread[t] = (int *)calloc((size_t)K, sizeof(int));
+        sum_thread[t] = (double *)calloc((size_t)(K + PADDING), sizeof(double));
+        cnt_thread[t] = (int *)calloc((size_t)(K + PADDING), sizeof(int));
         if (!sum_thread[t] || !cnt_thread[t])
         {
             fprintf(stderr, "Sem memoria para acumuladores\n");
