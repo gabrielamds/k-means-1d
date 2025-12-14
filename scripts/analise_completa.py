@@ -73,9 +73,9 @@ grande,MPI+CUDA,1p,419.8,3245639.673338
 grande,Hybrid(OpenMP+MPI),2t1p,287.0,3245639.673338
 grande,Hybrid(OpenMP+MPI),1t2p,295.0,3245639.673338
 grande,Hybrid(OpenMP+MPI),2t2p,310.0,3245639.673338"""
-        with open('results/resultados_colab.csv', 'w') as f:
     with open('results/resultados_colab.csv', 'w') as f:
-
+        f.write(colab_data)
+    
     windows = pd.read_csv('results/resultados_windows.csv')
     colab = pd.read_csv('results/resultados_colab.csv')
     
