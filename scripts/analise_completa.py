@@ -39,9 +39,9 @@ grande,OpenMP,2t,312.0,3245639.673338
 grande,OpenMP,4t,241.0,3245639.673338
 grande,OpenMP,8t,204.0,3245639.673338
 grande,MPI,2p,283.0,3245639.673338
-grande,OpenMP+MPI,2t1p,287.0,3245639.673338
-grande,OpenMP+MPI,1t2p,295.0,3245639.673338
-grande,OpenMP+MPI,2t2p,310.0,3245639.673338"""
+grande,Hybrid(OpenMP+MPI),2t1p,287.0,3245639.673338
+grande,Hybrid(OpenMP+MPI),1t2p,295.0,3245639.673338
+grande,Hybrid(OpenMP+MPI),2t2p,310.0,3245639.673338"""
         with open('results/resultados_windows.csv', 'w') as f:
             f.write(windows_data)
     
@@ -54,27 +54,27 @@ pequeno,OpenMP+CUDA,2t,83.3,1863826.514252
 pequeno,OpenMP+CUDA,4t,85.7,1863826.514252
 pequeno,OpenMP+CUDA,8t,94.6,1863826.514252
 pequeno,MPI+CUDA,1p,115.3,1863826.514252
-pequeno,OpenMP+MPI,2t1p,12.5,1863826.514252
-pequeno,OpenMP+MPI,1t2p,13.2,1863826.514252
-pequeno,OpenMP+MPI,2t2p,14.8,1863826.514252
+pequeno,Hybrid(OpenMP+MPI),2t1p,12.5,1863826.514252
+pequeno,Hybrid(OpenMP+MPI),1t2p,13.2,1863826.514252
+pequeno,Hybrid(OpenMP+MPI),2t2p,14.8,1863826.514252
 medio,CUDA,-,31.8,1201904.810535
 medio,OpenMP+CUDA,1t,101.1,1201904.810535
 medio,OpenMP+CUDA,2t,100.4,1201904.810535
 medio,OpenMP+CUDA,4t,120.9,1201904.810535
 medio,OpenMP+CUDA,8t,110.5,1201904.810535
 medio,MPI+CUDA,1p,107.9,1201904.810535
-medio,OpenMP+MPI,2t1p,25.3,1201904.810535
-medio,OpenMP+MPI,1t2p,27.1,1201904.810535
-medio,OpenMP+MPI,2t2p,29.5,1201904.810535
+medio,Hybrid(OpenMP+MPI),2t1p,25.3,1201904.810535
+medio,Hybrid(OpenMP+MPI),1t2p,27.1,1201904.810535
+medio,Hybrid(OpenMP+MPI),2t2p,29.5,1201904.810535
 grande,CUDA,-,246.7,3245639.673338
 grande,OpenMP+CUDA,1t,427.9,3245639.673338
 grande,OpenMP+CUDA,2t,585.8,3245639.673338
 grande,OpenMP+CUDA,4t,548.9,3245639.673338
 grande,OpenMP+CUDA,8t,493.8,3245639.673338
 grande,MPI+CUDA,1p,419.8,3245639.673338
-grande,OpenMP+MPI,2t1p,287.0,3245639.673338
-grande,OpenMP+MPI,1t2p,295.0,3245639.673338
-grande,OpenMP+MPI,2t2p,310.0,3245639.673338"""
+grande,Hybrid(OpenMP+MPI),2t1p,287.0,3245639.673338
+grande,Hybrid(OpenMP+MPI),1t2p,295.0,3245639.673338
+grande,Hybrid(OpenMP+MPI),2t2p,310.0,3245639.673338"""
         with open('results/resultados_colab.csv', 'w') as f:
             f.write(colab_data)
     
@@ -254,11 +254,11 @@ def plot_efficiency_analysis(df):
     best_mpi = data_grande[data_grande['implementacao'] == 'MPI'].nsmallest(1, 'tempo_ms').iloc[0]
     best_results.append((f"MPI\n({best_mpi['config']})", best_mpi['tempo_ms'], 'steelblue'))
     
-    # Melhor OpenMP+MPI
-    omp_mpi_data = data_grande[data_grande['implementacao'] == 'OpenMP+MPI']
+    # Melhor Hybrid(OpenMP+MPI)
+    omp_mpi_data = data_grande[data_grande['implementacao'] == 'Hybrid(OpenMP+MPI)']
     if not omp_mpi_data.empty:
         best_omp_mpi = omp_mpi_data.nsmallest(1, 'tempo_ms').iloc[0]
-        best_results.append((f"OpenMP+MPI\n({best_omp_mpi['config']})", best_omp_mpi['tempo_ms'], 'steelblue'))
+        best_results.append((f"Hybrid\nOMP+MPI\n({best_omp_mpi['config']})", best_omp_mpi['tempo_ms'], 'steelblue'))
     
     # CUDA puro
     cuda = data_grande[data_grande['implementacao'] == 'CUDA'].iloc[0]
