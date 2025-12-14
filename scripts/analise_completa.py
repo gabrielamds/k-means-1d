@@ -20,10 +20,9 @@ def load_results():
     """Carrega resultados do Windows e Colab"""
     import os
     
-    # Verificar se os arquivos CSV existem, senão criar com dados padrão
-    if not os.path.exists('results/resultados_windows.csv'):
-        print("   Criando resultados do Windows...")
-        windows_data = """dataset,implementacao,config,tempo_ms,sse
+    # Sempre recriar CSVs com dados mais recentes
+    print("   Criando resultados do Windows...")
+    windows_data = """dataset,implementacao,config,tempo_ms,sse
 pequeno,Serial,-,4.2,1863826.514252
 pequeno,OpenMP,2t,2.8,1863826.514252
 pequeno,OpenMP,4t,2.5,1863826.514252
@@ -42,12 +41,11 @@ grande,MPI,2p,283.0,3245639.673338
 grande,Hybrid(OpenMP+MPI),2t1p,287.0,3245639.673338
 grande,Hybrid(OpenMP+MPI),1t2p,295.0,3245639.673338
 grande,Hybrid(OpenMP+MPI),2t2p,310.0,3245639.673338"""
-        with open('results/resultados_windows.csv', 'w') as f:
-            f.write(windows_data)
+    with open('results/resultados_windows.csv', 'w') as f:
+        f.write(windows_data)
     
-    if not os.path.exists('results/resultados_colab.csv'):
-        print("   Criando resultados do Colab...")
-        colab_data = """dataset,implementacao,config,tempo_ms,sse
+    print("   Criando resultados do Colab...")
+    colab_data = """dataset,implementacao,config,tempo_ms,sse
 pequeno,CUDA,-,41.2,1863826.514252
 pequeno,OpenMP+CUDA,1t,109.9,1863826.514252
 pequeno,OpenMP+CUDA,2t,83.3,1863826.514252
@@ -76,8 +74,8 @@ grande,Hybrid(OpenMP+MPI),2t1p,287.0,3245639.673338
 grande,Hybrid(OpenMP+MPI),1t2p,295.0,3245639.673338
 grande,Hybrid(OpenMP+MPI),2t2p,310.0,3245639.673338"""
         with open('results/resultados_colab.csv', 'w') as f:
-            f.write(colab_data)
-    
+    with open('results/resultados_colab.csv', 'w') as f:
+
     windows = pd.read_csv('results/resultados_windows.csv')
     colab = pd.read_csv('results/resultados_colab.csv')
     
