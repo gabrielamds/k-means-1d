@@ -10,11 +10,11 @@ kmeans_1d_*
 # Arquivos de dados grandes
 data/dados_grande.csv
 data/dados_xlarge.csv
+data/*.csv
 
 # Resultados e saídas
 results/*.txt
 report/figures/*.png
-*.csv
 
 # Arquivos temporários
 *.tmp
