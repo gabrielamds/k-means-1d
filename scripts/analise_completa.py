@@ -38,7 +38,10 @@ grande,Serial,-,574.0,3245639.673338
 grande,OpenMP,2t,312.0,3245639.673338
 grande,OpenMP,4t,241.0,3245639.673338
 grande,OpenMP,8t,204.0,3245639.673338
-grande,MPI,2p,283.0,3245639.673338"""
+grande,MPI,2p,283.0,3245639.673338
+grande,OpenMP+MPI,2t1p,287.0,3245639.673338
+grande,OpenMP+MPI,1t2p,295.0,3245639.673338
+grande,OpenMP+MPI,2t2p,310.0,3245639.673338"""
         with open('results/resultados_windows.csv', 'w') as f:
             f.write(windows_data)
     
@@ -51,18 +54,27 @@ pequeno,OpenMP+CUDA,2t,83.3,1863826.514252
 pequeno,OpenMP+CUDA,4t,85.7,1863826.514252
 pequeno,OpenMP+CUDA,8t,94.6,1863826.514252
 pequeno,MPI+CUDA,1p,115.3,1863826.514252
+pequeno,OpenMP+MPI,2t1p,12.5,1863826.514252
+pequeno,OpenMP+MPI,1t2p,13.2,1863826.514252
+pequeno,OpenMP+MPI,2t2p,14.8,1863826.514252
 medio,CUDA,-,31.8,1201904.810535
 medio,OpenMP+CUDA,1t,101.1,1201904.810535
 medio,OpenMP+CUDA,2t,100.4,1201904.810535
 medio,OpenMP+CUDA,4t,120.9,1201904.810535
 medio,OpenMP+CUDA,8t,110.5,1201904.810535
 medio,MPI+CUDA,1p,107.9,1201904.810535
+medio,OpenMP+MPI,2t1p,25.3,1201904.810535
+medio,OpenMP+MPI,1t2p,27.1,1201904.810535
+medio,OpenMP+MPI,2t2p,29.5,1201904.810535
 grande,CUDA,-,246.7,3245639.673338
 grande,OpenMP+CUDA,1t,427.9,3245639.673338
 grande,OpenMP+CUDA,2t,585.8,3245639.673338
 grande,OpenMP+CUDA,4t,548.9,3245639.673338
 grande,OpenMP+CUDA,8t,493.8,3245639.673338
-grande,MPI+CUDA,1p,419.8,3245639.673338"""
+grande,MPI+CUDA,1p,419.8,3245639.673338
+grande,OpenMP+MPI,2t1p,287.0,3245639.673338
+grande,OpenMP+MPI,1t2p,295.0,3245639.673338
+grande,OpenMP+MPI,2t2p,310.0,3245639.673338"""
         with open('results/resultados_colab.csv', 'w') as f:
             f.write(colab_data)
     
@@ -242,6 +254,12 @@ def plot_efficiency_analysis(df):
     best_mpi = data_grande[data_grande['implementacao'] == 'MPI'].nsmallest(1, 'tempo_ms').iloc[0]
     best_results.append((f"MPI\n({best_mpi['config']})", best_mpi['tempo_ms'], 'steelblue'))
     
+    # Melhor OpenMP+MPI
+    omp_mpi_data = data_grande[data_grande['implementacao'] == 'OpenMP+MPI']
+    if not omp_mpi_data.empty:
+        best_omp_mpi = omp_mpi_data.nsmallest(1, 'tempo_ms').iloc[0]
+        best_results.append((f"OpenMP+MPI\n({best_omp_mpi['config']})", best_omp_mpi['tempo_ms'], 'steelblue'))
+    
     # CUDA puro
     cuda = data_grande[data_grande['implementacao'] == 'CUDA'].iloc[0]
     best_results.append(('CUDA\n(GPU)', cuda['tempo_ms'], 'orange'))
@@ -340,11 +358,13 @@ Este projeto implementou e avaliou diferentes estratégias de paralelização do
 - Serial (baseline)
 - OpenMP (multi-threading)
 - MPI (memória distribuída)
+- OpenMP + MPI (híbrido CPU)
 
 **Plataforma Google Colab (GPU Tesla T4):**
 - CUDA (aceleração GPU)
 - OpenMP + CUDA (híbrido)
 - MPI + CUDA (híbrido distribuído)
+- OpenMP + MPI (híbrido CPU no Colab)
 
 ## 2. Datasets de Teste
 
@@ -370,6 +390,11 @@ Três datasets sintéticos foram gerados com seeds fixos para reprodutibilidade:
 - Overhead de comunicação limitou ganhos
 - Não escalou bem além de 2 processos
 
+**OpenMP + MPI** combina paralelismo de memória compartilhada e distribuída:
+- Dataset GRANDE: Similar ao MPI puro (~287-310ms)
+- Overhead de coordenação entre processos e threads
+- Adequado para clusters com múltiplos nós multi-core
+
 ### 3.2 Implementações GPU (Google Colab)
 
 **CUDA puro** foi o **mais rápido** em todos os datasets:
@@ -386,11 +411,12 @@ Três datasets sintéticos foram gerados com seeds fixos para reprodutibilidade:
 
 ### Melhor Desempenho por Dataset (Dataset GRANDE):
 
-1. **CUDA (GPU)**: 246.7 ms (2.33x speedup) 🏆
-2. **OpenMP 8t (CPU)**: 204.0 ms (2.81x speedup) 🏆🏆
+1. **OpenMP 8t (CPU)**: 204.0 ms (2.81x speedup) 🏆🏆
+2. **CUDA (GPU)**: 246.7 ms (2.33x speedup) 🏆
 3. **MPI 2p (CPU)**: 283.0 ms (2.03x speedup)
-4. **MPI+CUDA 1p (GPU)**: 419.8 ms (1.37x speedup)
-5. **OpenMP+CUDA 1t (GPU)**: 427.9 ms (1.34x speedup)
+4. **OpenMP+MPI 2t1p (CPU)**: 287.0 ms (2.00x speedup)
+5. **MPI+CUDA 1p (GPU)**: 419.8 ms (1.37x speedup)
+6. **OpenMP+CUDA 1t (GPU)**: 427.9 ms (1.34x speedup)
 
 **Observação importante:** OpenMP em CPU foi mais rápido que CUDA em GPU para este dataset!
 
@@ -401,6 +427,7 @@ Três datasets sintéticos foram gerados com seeds fixos para reprodutibilidade:
 3. **Híbridos GPU** não compensam: overhead > benefício
 4. **OpenMP** teve melhor custo/benefício em CPU
 5. **MPI** adequado apenas para clusters verdadeiramente distribuídos
+6. **OpenMP+MPI** útil em clusters multi-core, mas overhead limita ganhos em single node
 
 ## 6. Gráficos
 
