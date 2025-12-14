@@ -142,6 +142,8 @@ __global__ void kernel_assignment(const double *X, const double *C, int *assign,
     if (i >= N)
         return;
 
+    sse_per_point[i] = 0.0;
+
     int best = 0;
     double bestd = 1e300;
 
@@ -180,6 +182,14 @@ static void kmeans_1d_mpi_cuda(const double *X_local, double *C, int *assign_loc
     cudaMalloc(&assign_dev, N_local * sizeof(int));
     cudaMalloc(&sse_dev, N_local * sizeof(double));
 
+    double *sse_zero = (double *)calloc(N_local, sizeof(double));
+    cudaMemcpy(sse_dev, sse_zero, N_local * sizeof(double), cudaMemcpyHostToDevice);
+    cudaDeviceSynchronize();
+    free(sse_zero);
+
+    cudaMemcpy(X_dev, X_local, N_local * sizeof(double), cudaMemcpyHostToDevice);
+    cudaDeviceSynchronize();
+
     double *sse_per_point = (double *)malloc(N_local * sizeof(double));
 
     double prev_sse = 1e300;
@@ -191,17 +201,23 @@ static void kmeans_1d_mpi_cuda(const double *X_local, double *C, int *assign_loc
 
     for (it = 0; it < max_iter; it++)
     {
-        /* Copia dados para GPU */
-        cudaMemcpy(X_dev, X_local, N_local * sizeof(double), cudaMemcpyHostToDevice);
         cudaMemcpy(C_dev, C, K * sizeof(double), cudaMemcpyHostToDevice);
+        cudaDeviceSynchronize();
+
+        cudaMemset(sse_dev, 0, N_local * sizeof(double));
+        cudaDeviceSynchronize();
 
         /* Kernel assignment na GPU local */
         int grid_size = (N_local + block_size - 1) / block_size;
         kernel_assignment<<<grid_size, block_size>>>(X_dev, C_dev, assign_dev, sse_dev, N_local, K);
+        
+        cudaDeviceSynchronize();
 
         /* Copia resultados de volta */
         cudaMemcpy(assign_local, assign_dev, N_local * sizeof(int), cudaMemcpyDeviceToHost);
         cudaMemcpy(sse_per_point, sse_dev, N_local * sizeof(double), cudaMemcpyDeviceToHost);
+        
+        cudaDeviceSynchronize();
 
         /* Redução SSE local */
         double sse_local = 0.0;
@@ -215,13 +231,15 @@ static void kmeans_1d_mpi_cuda(const double *X_local, double *C, int *assign_loc
             printf("Iteração %d: SSE = %.6f\n", it + 1, sse_global);
 
         /* Convergência */
-        double rel = fabs(sse_global - prev_sse) / (prev_sse > 0.0 ? prev_sse : 1.0);
-        if (rel < eps)
-        {
-            if (rank == 0)
-                printf("Convergiu (variação relativa < %.6f)\n", eps);
-            it++;
-            break;
+        if (it > 0) {
+            double rel = fabs(sse_global - prev_sse) / (prev_sse > 0.0 ? prev_sse : 1.0);
+            if (rel < eps)
+            {
+                if (rank == 0)
+                    printf("Convergiu (variação relativa < %.6f)\n", eps);
+                it++;
+                break;
+            }
         }
 
         /* Update: acumulação local no host */
