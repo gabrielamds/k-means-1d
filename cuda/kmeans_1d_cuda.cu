@@ -574,13 +574,24 @@ void print_results(KMeansMetrics* metrics) {
 }
 
 int main(int argc, char* argv[]) {
-    const char* data_file = "../data/dados.csv";
-    const char* centroids_file = "../data/centroides_iniciais.csv";
+    const char* data_file = NULL;
+    const char* centroids_file = NULL;
+    int max_iter = MAX_ITER;
+    double eps = EPS;
     int block_size = DEFAULT_BLOCK_SIZE;
     int run_analysis = 0;
     double serial_time = 0.0;
     
-    // Parsing de argumentos
+    // Parsing de argumentos - formato padrão: dados.csv centroides.csv max_iter eps block_size
+    if (argc >= 3) {
+        data_file = argv[1];
+        centroids_file = argv[2];
+        if (argc >= 4) max_iter = atoi(argv[3]);
+        if (argc >= 5) eps = atof(argv[4]);
+        if (argc >= 6) block_size = atoi(argv[5]);
+    }
+    
+    // Suportar flags opcionais também
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
             block_size = atoi(argv[++i]);
@@ -593,15 +604,22 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
             centroids_file = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            printf("Uso: %s [opções]\n", argv[0]);
+            printf("Uso: %s dados.csv centroides.csv [max_iter] [eps] [block_size]\n", argv[0]);
+            printf("  ou: %s [opções]\n", argv[0]);
             printf("Opções:\n");
+            printf("  -d <arquivo>  Arquivo de dados\n");
+            printf("  -c <arquivo>  Arquivo de centróides\n");
             printf("  -b <num>      Block size (padrão: 256)\n");
             printf("  -a            Executar análise de block size\n");
             printf("  --serial-time <ms>  Tempo serial (para speedup)\n");
-            printf("  -d <arquivo>  Arquivo de dados\n");
-            printf("  -c <arquivo>  Arquivo de centróides\n");
             return 0;
         }
+    }
+    
+    if (!data_file || !centroids_file) {
+        fprintf(stderr, "ERRO: Arquivos de dados e centróides são obrigatórios!\n");
+        fprintf(stderr, "Uso: %s dados.csv centroides.csv [max_iter] [eps] [block_size]\n", argv[0]);
+        return 1;
     }
     
     print_header();
